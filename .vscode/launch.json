@@ -1,0 +1,42 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Server: iniciar web (porta 8000)",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/app/carbuy_agenda_web.py",
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "args": []
+    },
+    {
+      "name": "Server: porta custom (9000)",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/app/carbuy_agenda_web.py",
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "args": ["--port", "9000"],
+      "postDebugTask": "Abrir navegador (porta 9000)"
+    },
+    {
+      "name": "CLI: gerar Excel (sem servidor)",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/app/carbuy_agenda_web.py",
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "args": ["--cli", "--user", "convidado10", "--pass", "convidado10", "--no-headless", "--concurrency", "3"]
+    },
+    {
+      "name": "Tests: unitários embutidos",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/app/carbuy_agenda_web.py",
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "args": ["--test"]
+    }
+  ]
+}
