@@ -1,5 +1,6 @@
-# Carbuy Coletor — HTTPServer + Playwright (resumo dinâmico por status)
-# Fluxo: informar até 3 eventos (código CBY ou URL) -> login automático -> coleta -> Resumo do evento + Resumo por Status
+# Carbuy Coletor — HTTPServer + Playwright (paginação por URL estável + Excel + WhatsApp)
+# Fluxo: informar até 3 eventos (código CBY ou URL) -> login automático -> coleta
+# -> Resumo do evento + Resumo por Status + Tabela de Lotes + Exportar Excel + WhatsApp
 
 import asyncio
 import os
@@ -7,9 +8,10 @@ import re
 import sys
 import time
 import html
+import traceback
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import parse_qs
+from urllib.parse import parse_qs, urlencode, urlparse, parse_qsl, urlunparse, quote
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import pandas as pd
@@ -24,7 +26,11 @@ except ImportError:
 
 BASE_URL = "https://www.carbuy.com.br"
 ASSETS_DIR = os.path.join(os.path.dirname(__file__), "assets")
-LOGO_FILE = os.path.join(ASSETS_DIR, "logo_carbuy.png")
+LOGO_FILE = os.path.join(ASSETS_DIR, "logo_carbuytransparent.png")
+
+# ---- export (memória)
+EXPORT_BYTES: Optional[bytes] = None
+EXPORT_NAME: str = "carbuy_export.xlsx"
 
 DATE_REGEX = re.compile(
     r"\b(\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4})(?:\s*(?:às|as|,|\-|)\s*(\d{1,2}:\d{2}))?\b",
@@ -76,6 +82,7 @@ class EventHeader:
 @dataclass
 class ItemRow:
     event_url: str
+    lot_url: Optional[str]
     model: Optional[str]
     status_text: Optional[str]
     current_value: Optional[str]
@@ -129,6 +136,35 @@ def build_event_url(x: str) -> Optional[str]:
         return f"{BASE_URL}/evento/detalhes/{x.lower()}"
     return None
 
+def _update_query(url: str, key: str, value: str) -> str:
+    parts = list(urlparse(url))
+    q = dict(parse_qsl(parts[4]))
+    q[key] = value
+    parts[4] = urlencode(q, doseq=True)
+    return urlunparse(parts)
+
+# ---------- helpers de navegação "suave" ----------
+CARD_SELECTORS = ".card-anuncio, .card.text-center.h-100, div[class*='card-anuncio']"
+
+async def wait_list_ready(page, timeout_ms: int = 8000):
+    """Espera suave pela lista de cards sem depender de 'networkidle'."""
+    try:
+        await page.wait_for_selector(CARD_SELECTORS, timeout=timeout_ms)
+    except Exception:
+        try:
+            await page.wait_for_timeout(600)
+        except Exception:
+            pass
+
+async def safe_goto(page, url: str, timeout_nav: int = 6000) -> bool:
+    """Navega por URL com tolerância a fechamento/contexto."""
+    try:
+        await page.goto(url, wait_until="domcontentloaded")
+        await wait_list_ready(page, timeout_ms=timeout_nav)
+        return True
+    except Exception:
+        return False
+
 async def first_visible(page, selectors: List[str], timeout: int = 6000):
     deadline = time.time() + (timeout / 1000)
     last_err = None
@@ -162,25 +198,19 @@ async def is_logged(page) -> bool:
     return False
 
 async def ensure_login(context, username: str, password: str, return_after: Optional[str] = None) -> None:
-    """Garante login; tenta /conta/entrar com returnUrl, fecha cookies, preenche em frames se preciso."""
+    """Garante login sem esperar networkidle e sem navegar para o evento (evita abrir duas vezes)."""
     page = await context.new_page()
     try:
-        target = return_after or BASE_URL
-        await page.goto(target, wait_until="domcontentloaded")
-        try:
-            await page.wait_for_load_state("networkidle", timeout=12000)
-        except PWTimeout:
-            pass
+        # Sempre começa pela home (não vamos abrir o evento aqui)
+        ok = await safe_goto(page, BASE_URL, timeout_nav=7000)
+        if not ok:
+            raise RuntimeError("Navegador fechado durante o login (safe_goto falhou no alvo inicial).")
 
         if await is_logged(page):
             return
 
-        if "/conta/entrar" not in page.url and "/login" not in page.url:
-            await page.goto(f"{BASE_URL}/conta/entrar?returnUrl={target.replace(BASE_URL,'')}", wait_until="domcontentloaded")
-            try:
-                await page.wait_for_load_state("networkidle", timeout=12000)
-            except PWTimeout:
-                pass
+        # força /conta/entrar
+        await safe_goto(page, f"{BASE_URL}/conta/entrar", timeout_nav=7000)
 
         # fecha/aceita cookies
         for sel in [
@@ -272,22 +302,14 @@ async def ensure_login(context, username: str, password: str, return_after: Opti
             except Exception:
                 pass
 
+        # NÃO navegar para o evento aqui.
+        # O loop principal abrirá o(s) evento(s) uma única vez.
+    finally:
         try:
-            await page.wait_for_load_state("networkidle", timeout=15000)
-        except PWTimeout:
+            await page.close()
+        except Exception:
             pass
 
-        if not await is_logged(page):
-            raise RuntimeError("Falha no login automático (campos não visíveis ou credenciais recusadas).")
-
-        if return_after:
-            await page.goto(return_after, wait_until="domcontentloaded")
-            try:
-                await page.wait_for_load_state("networkidle", timeout=12000)
-            except PWTimeout:
-                pass
-    finally:
-        await page.close()
 
 # ---------- parsing de /evento/detalhes ----------
 async def parse_event_header(page) -> EventHeader:
@@ -329,32 +351,24 @@ async def parse_event_header(page) -> EventHeader:
 
     return EventHeader(url, event_code, event_datetime, status)
 
+# ---------- itens da página corrente + link do lote ----------
 async def collect_items_current_page(page, event_url: str) -> List[ItemRow]:
     rows: List[ItemRow] = []
+
     container = page.locator("#placeholder, #ev-list, .ev-list, .container-fluid.ev-list").first
     if await container.count() == 0:
         container = page.locator("body")
 
-    cards_loc = container.locator(".card-anuncio, .card.text-center.h-100, div[class*='card-anuncio']")
-    count = await cards_loc.count()
-    indices = range(count) if count else [-1]
-
-    for i in indices:
-        if i >= 0:
-            try:
-                card_classes = (await cards_loc.nth(i).get_attribute("class") or "").lower()
-            except Exception:
-                card_classes = ""
-            html_card = await cards_loc.nth(i).inner_html()
-        else:
-            card_classes = ""
-            html_card = await container.inner_html()
-
+    cards = container.locator(CARD_SELECTORS)
+    count = await cards.count()
+    for i in range(count):
+        card = cards.nth(i)
+        html_card = await card.inner_html()
         soup = BeautifulSoup(html_card, "lxml") if "lxml" in sys.modules else BeautifulSoup(html_card, "html.parser")
 
         # Modelo
         model = None
-        for sel in (".card-title h1", "h1.card-title", "h1"):
+        for sel in (".card-title h1", "h1.card-title", "h1", ".card-title h2", "h2.card-title", "h2"):
             el = soup.select_one(sel)
             if el:
                 model = _clean_text(el.get_text(" "))
@@ -378,17 +392,6 @@ async def collect_items_current_page(page, event_url: str) -> List[ItemRow]:
             if m:
                 status_text = _clean_text(m.group(1))
 
-        # Refino por classes CSS (ex.: 'anuncio-Vendido', 'anuncio-Condicional')
-        css_classes = card_classes + " " + " ".join(
-            " ".join(el.get("class", [])) if isinstance(el.get("class"), list) else (el.get("class") or "")
-            for el in soup.select("[class*='anuncio-'], [class*='vend'], [class*='condic']")
-        )
-        css_classes = css_classes.lower()
-        if "anuncio-vendido" in css_classes or "arrematado" in css_classes or re.search(r"\bvendid", css_classes):
-            status_text = "Vendido"
-        elif "anuncio-condicional" in css_classes or re.search(r"\bcondic", css_classes):
-            status_text = "Condicional"
-
         # Valor Atual
         current_value = None
         for sel in (".card-valoratual h2", "h2.valor-atual", ".valor-atual", "span.valor-atual"):
@@ -399,57 +402,93 @@ async def collect_items_current_page(page, event_url: str) -> List[ItemRow]:
                     current_value = val
                     break
 
-        if any([model, status_text, current_value]):
-            rows.append(ItemRow(event_url, model, status_text, current_value))
+        # Link do lote
+        lot_url = None
+        try:
+            anchor = card.locator("a[href*='/evento/anuncio/'], a[href*='/anuncio/'], a[href*='/lote/'], a.card, a").first
+            if await anchor.count() > 0:
+                href = await anchor.get_attribute("href")
+                if href:
+                    lot_url = href if href.startswith("http") else (BASE_URL + href if href.startswith("/") else BASE_URL + "/" + href)
+        except Exception:
+            for a in soup.select("a[href]"):
+                href = a.get("href") or ""
+                if "/evento/anuncio/" in href or "/anuncio/" in href or "/lote/" in href:
+                    lot_url = href if href.startswith("http") else (BASE_URL + href if href.startswith("/") else BASE_URL + "/" + href)
+                    break
+
+        if any([model, status_text, current_value, lot_url]):
+            rows.append(ItemRow(event_url, lot_url, model, status_text, current_value))
 
     return rows
 
-async def has_next_page(page) -> Tuple[bool, Optional[str]]:
-    next_locators = [
-        "a[rel='next']",
-        "a[aria-label*='róximo' i]",
-        "button[aria-label*='róximo' i]",
-        "a.page-link:has-text('Próximo')",
-        "a:has-text('Próximo')",
-    ]
-    for sel in next_locators:
-        loc = page.locator(sel).first
-        try:
-            if await loc.count() > 0 and await loc.is_enabled():
-                return True, sel
-        except Exception:
-            pass
-    return False, None
+# ---------- paginação: SOMENTE por URL (sem cliques) ----------
+def _fallback_next_url(url: str) -> Optional[str]:
+    # incrementa pageNumber/page/pagina/lotePage preservando outros parâmetros (ex.: handler=pesquisar)
+    for key in ("pageNumber", "page", "pagina", "lotePage"):
+        parts = list(urlparse(url))
+        q = dict(parse_qsl(parts[4]))
+        if key in q:
+            cur = re.sub(r"\D", "", q[key] or "")
+            nxt = str(int(cur) + 1) if cur.isdigit() else "2"
+            q[key] = nxt
+            parts[4] = urlencode(q, doseq=True)
+            return urlunparse(parts)
+    # se não tinha nada, cria pageNumber=2
+    parts = list(urlparse(url))
+    q = dict(parse_qsl(parts[4]))
+    q["pageNumber"] = "2"
+    parts[4] = urlencode(q, doseq=True)
+    return urlunparse(parts)
 
-async def click_next(page, selector: str) -> bool:
-    try:
-        loc = page.locator(selector).first
-        await loc.click()
-        try:
-            await page.wait_for_load_state("networkidle", timeout=8000)
-        except PWTimeout:
-            pass
-        return True
-    except Exception:
-        return False
-
-async def collect_items_with_pagination(page, event_url: str) -> List[ItemRow]:
+async def collect_items_with_pagination(page, event_url: str, max_pages: int = 200) -> List[ItemRow]:
     all_rows: List[ItemRow] = []
-    all_rows.extend(await collect_items_current_page(page, event_url))
+    seen_urls = set()
+    prev_total = -1
+    no_progress = 0
 
-    for _ in range(100):  # limite de segurança
-        has_next, sel = await has_next_page(page)
-        if not has_next or not sel:
+    while True:
+        if page.is_closed():
             break
-        if not await click_next(page, sel):
+
+        cur_url = page.url
+        seen_urls.add(cur_url)
+
+        # coleta da página atual
+        try:
+            page_rows = await collect_items_current_page(page, event_url)
+        except Exception:
+            page_rows = []
+        if page_rows:
+            all_rows.extend(page_rows)
+
+        # progresso?
+        if len(all_rows) == prev_total:
+            no_progress += 1
+        else:
+            no_progress = 0
+            prev_total = len(all_rows)
+
+        # paradas seguras
+        if no_progress >= 2:
             break
-        all_rows.extend(await collect_items_current_page(page, event_url))
+        if len(seen_urls) >= max_pages:
+            break
+
+        # SEM CLIQUES: força URL da próxima página
+        next_url = _fallback_next_url(cur_url)
+        if not next_url or next_url in seen_urls:
+            break
+
+        ok = await safe_goto(page, next_url, timeout_nav=7000)
+        if not ok:
+            break
 
     # dedup
-    uniq = []
+    uniq: List[ItemRow] = []
     seen = set()
     for r in all_rows:
-        key = (r.event_url, r.model, r.status_text, r.current_value)
+        key = (r.event_url, r.lot_url, r.model, r.status_text, r.current_value)
         if key not in seen:
             seen.add(key)
             uniq.append(r)
@@ -473,12 +512,98 @@ def summarize_dynamic(header: EventHeader, items: List[ItemRow]) -> Dict[str, An
         "Evento": normalize_event_code(header.event_code) or header.event_code,
         "Data/Horário": header.event_datetime,
         "Status_Evento": header.event_status,
-        "Total_Anuncios": len(ev_items),
+        "Total_Anúncios": len(ev_items),
         "Status_Count": status_count,
         "Status_Sum": status_sum,
+        "Event_URL": header.event_url,
     }
 
+# -------- Excel / WhatsApp helpers --------
+def _items_to_dataframe(items: Optional[List[ItemRow]]) -> pd.DataFrame:
+    items = items or []
+    rows = []
+    for it in items:
+        rows.append({
+            "Evento_URL": it.event_url,
+            "Modelo": it.model or "",
+            "Status": it.status_text or "",
+            "Valor_Atual": it.current_value or "",
+            "URL_Anuncio": it.lot_url or "",
+        })
+    return pd.DataFrame(rows)
+
+def _make_excel_bytes(df: pd.DataFrame, summaries: Optional[List[Dict[str, Any]]]) -> bytes:
+    """Tenta openpyxl → xlsxwriter → engine automático, sem derrubar o servidor."""
+    summaries = summaries or []
+    from io import BytesIO
+    bio = BytesIO()
+
+    def _write_with_engine(engine_name: Optional[str]):
+        with pd.ExcelWriter(bio, engine=engine_name) as writer:
+            df.to_excel(writer, index=False, sheet_name="Lotes")
+            for i, s in enumerate(summaries, start=1):
+                s = s or {}
+                sheet = f"Resumo_{i}"
+                res_df = pd.DataFrame([
+                    {"Status": st, "Quantidade": qtd, "Soma": fmt_brl(float(s.get("Status_Sum", {}).get(st, 0.0)))}
+                    for st, qtd in sorted((s.get("Status_Count") or {}).items(), key=lambda kv: (-kv[1], kv[0].lower()))
+                ])
+                if res_df.empty:
+                    res_df = pd.DataFrame([{"Status": "", "Quantidade": 0, "Soma": "R$ 0,00"}])
+                res_df.to_excel(writer, index=False, sheet_name=sheet)
+
+    # tenta openpyxl
+    try:
+        _write_with_engine("openpyxl")
+        return bio.getvalue()
+    except ModuleNotFoundError:
+        pass
+
+    # fallback: xlsxwriter
+    try:
+        _write_with_engine("xlsxwriter")
+        return bio.getvalue()
+    except ModuleNotFoundError:
+        pass
+
+    # último recurso: engine automático (se houver algum disponível)
+    _write_with_engine(None)
+    return bio.getvalue()
+
+def build_whatsapp_text(summaries: Optional[List[Dict[str, Any]]]) -> str:
+    summaries = summaries or []
+    parts = []
+    for s in summaries:
+        s = s or {}
+        code = s.get("Evento") or ""
+        parts.append(f"Resumo por Status — {code}")
+        parts.append("Status\tQuantidade\tSoma")
+        status_count = s.get("Status_Count", {}) or {}
+        status_sum = s.get("Status_Sum", {}) or {}
+        for st, qtd in sorted(status_count.items(), key=lambda kv: (-kv[1], kv[0].lower())):
+            soma = fmt_brl(float(status_sum.get(st, 0.0)))
+            parts.append(f"{st}\t{qtd}\t{soma}")
+        parts.append("")
+    text = "\n".join(parts).strip()
+    return f"https://wa.me/?text={quote(text)}"
+
 # --------------- fluxo principal ---------------
+async def _auto_close_if_popup(p):
+    """Fecha páginas abertas via window.open/target=_blank (tem 'opener')."""
+    try:
+        op = None
+        try:
+            op = await p.opener()
+        except Exception:
+            try:
+                op = p.opener
+            except Exception:
+                op = None
+        if op:
+            await p.close()
+    except Exception:
+        pass
+
 async def scrape(username: str, password: str, headless: bool, event_inputs: List[str]):
     headers: List[EventHeader] = []
     items: List[ItemRow] = []
@@ -495,31 +620,54 @@ async def scrape(username: str, password: str, headless: bool, event_inputs: Lis
         browser = await p.chromium.launch(headless=headless)
         context = await browser.new_context(viewport={"width": 1366, "height": 900})
 
-        # login obrigatório — usa o 1º evento como returnUrl
-        return_after = urls[0] if urls else BASE_URL
-        await ensure_login(context, username, password, return_after=return_after)
+        # Fecha popups automaticamente (apenas se tiver 'opener')
+        context.on("page", lambda page: asyncio.create_task(_auto_close_if_popup(page)))
+
+        # Faz login sem abrir o evento (evita abrir duas vezes)
+        await ensure_login(context, username, password, return_after=None)
+
 
         # coleta por evento
         for u in urls:
+            if len(context.pages) > 20:  # hard cap defensivo
+                break
             ev = await context.new_page()
             try:
-                await ev.goto(u, wait_until="domcontentloaded")
-                try:
-                    await ev.wait_for_load_state("networkidle", timeout=10000)
-                except PWTimeout:
-                    pass
+                ok = await safe_goto(ev, u, timeout_nav=8000)
+                if not ok:
+                    break
                 header = await parse_event_header(ev)
                 headers.append(header)
-                rows = await collect_items_with_pagination(ev, header.event_url)
-                items.extend(rows)
-            finally:
-                await ev.close()
 
-        await browser.close()
+                page_items = await collect_items_with_pagination(ev, header.event_url)
+                items.extend(page_items or [])
+            except Exception:
+                # se navegador/ctx fechar, aborta loop
+                break
+            finally:
+                try:
+                    await ev.close()
+                except Exception:
+                    pass
+
+        # fecha tudo antes do browser
+        for p_ in context.pages:
+            try:
+                await p_.close()
+            except Exception:
+                pass
+        try:
+            await context.close()
+        except Exception:
+            pass
+        try:
+            await browser.close()
+        except Exception:
+            pass
 
     # resumo por evento (dinâmico)
     summaries = [summarize_dynamic(h, items) for h in headers]
-    return summaries  # lista de dicionários por evento
+    return headers, summaries, items
 
 # --------------- servidor web ---------------
 def _read_logo_bytes() -> Optional[bytes]:
@@ -535,30 +683,38 @@ def base_html(body: str, message: str = "") -> bytes:
   <meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/>
   <title>Carbuy Coletor</title>
   <style>
-    :root {{ --red:#ff1a1a; --dark:#0b0f14; --card:#111827; --border:#2a3441; --text:#e6edf3; --muted:#a6b3c2; --btn:#000 }}
+    :root {{ 
+      --red:#ff1a1a; 
+      --dark:#fff;
+      --card:#f9f9f9;
+      --border:#ddd;
+      --text:#000;
+      --muted:#555;
+      --btn:var(--red);
+    }}
     * {{ box-sizing:border-box }}
     body {{ margin:0; background:var(--dark); color:var(--text); font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial }}
     .hero {{ background:var(--red); padding:32px 16px; display:flex; justify-content:center }}
     .hero img {{ height:110px; width:auto; display:block }}
     .wrap {{ max-width:980px; margin:0 auto; padding:24px 16px }}
-    .card {{ background:var(--card); border:1px solid var(--border); border-radius:14px; padding:20px; box-shadow:0 10px 30px rgba(0,0,0,.25); margin-bottom:16px }}
+    .card {{ background:var(--card); border:1px solid var(--border); border-radius:14px; padding:20px; box-shadow:0 4px 12px rgba(0,0,0,.1); margin-bottom:16px }}
     h1 {{ margin:0 0 8px 0; font-size:24px }}
     h2 {{ margin:0 0 8px 0; font-size:20px }}
     p.muted {{ color:var(--muted); margin:0 0 16px 0 }}
     label {{ font-size:12px; color:var(--muted); display:block; margin-bottom:6px }}
-    input,select {{ width:100%; padding:12px 14px; border-radius:10px; border:1px solid var(--border); background:#0f172a; color:var(--text); outline:none }}
+    input,select {{ width:100%; padding:12px 14px; border-radius:10px; border:1px solid var(--border); background:#fff; color:#000; outline:none }}
     .row {{ display:grid; grid-template-columns:1fr 1fr; gap:14px }}
     .row-1 {{ display:grid; grid-template-columns:1fr; gap:14px }}
-    .btn {{ width:100%; padding:12px 16px; border-radius:12px; background:var(--btn); color:#fff; border:none; cursor:pointer; font-weight:700; letter-spacing:.3px }}
+    .btn {{ width:100%; padding:12px 16px; border-radius:12px; background:var(--btn); color:#fff; border:none; cursor:pointer; font-weight:700; letter-spacing:.3px; text-align:center }}
     .btn:active {{ transform:translateY(1px) }}
     .footer {{ text-align:center; color:#fff; background:var(--red); padding:10px 12px; font-size:12px; margin-top:24px }}
     table.grid {{ width:100%; border-collapse:collapse; margin-top:8px }}
     table.grid th,table.grid td {{ border:1px solid var(--border); padding:6px 8px; text-align:left }}
-    table.grid th {{ background:#0f172a }}
-    .msg {{ margin:12px 0; padding:10px 12px; background:#1f2937; border:1px solid var(--border); border-radius:10px }}
-    .actions {{ display:flex; gap:10px; margin-top:12px }}
+    table.grid th {{ background:#f0f0f0 }}
+    .msg {{ margin:12px 0; padding:10px 12px; background:#f8f8f8; border:1px solid var(--border); border-radius:10px; color:#000 }}
+    .actions {{ display:flex; gap:10px; margin-top:12px; flex-wrap:wrap }}
     .link {{ color:#fff; text-decoration:none }}
-    .pill {{ display:inline-block; background:#0f172a; border:1px solid var(--border); border-radius:999px; padding:3px 10px; margin-left:8px; font-size:12px; }}
+    .pill {{ display:inline-block; background:#eee; border:1px solid var(--border); border-radius:999px; padding:3px 10px; margin-left:8px; font-size:12px; color:#000 }}
   </style>
 </head>
 <body>
@@ -568,26 +724,28 @@ def base_html(body: str, message: str = "") -> bytes:
 </body></html>"""
     return page.encode("utf-8")
 
-def table_basic_summary(summaries: List[Dict[str, Any]]) -> str:
+def table_basic_summary(summaries: Optional[List[Dict[str, Any]]]) -> str:
+    summaries = summaries or []
     if not summaries:
         return "<p class='muted'>(vazio)</p>"
-    # Tabela: Evento / Data-Hora / Status_Evento / Total_Anuncios
     rows = []
     rows.append("<table class='grid'><thead><tr>"
                 "<th>Evento</th><th>Data/Horário</th><th>Status_Evento</th><th>Total_Anúncios</th>"
                 "</tr></thead><tbody>")
     for s in summaries:
+        s = s or {}
         rows.append("<tr>"
                     f"<td>{html.escape(str(s.get('Evento') or ''))}</td>"
                     f"<td>{html.escape(str(s.get('Data/Horário') or ''))}</td>"
                     f"<td>{html.escape(str(s.get('Status_Evento') or ''))}</td>"
-                    f"<td>{int(s.get('Total_Anuncios') or 0)}</td>"
+                    f"<td>{int(s.get('Total_Anúncios') or s.get('Total_Anuncios') or 0)}</td>"
                     "</tr>")
     rows.append("</tbody></table>")
     return "".join(rows)
 
 def table_status_breakdown(summary: Dict[str, Any]) -> str:
     """Tabela dinâmica por status para 1 evento."""
+    summary = summary or {}
     status_count: Dict[str, int] = summary.get("Status_Count", {}) or {}
     status_sum: Dict[str, float] = summary.get("Status_Sum", {}) or {}
 
@@ -596,14 +754,27 @@ def table_status_breakdown(summary: Dict[str, Any]) -> str:
 
     rows = []
     rows.append("<table class='grid'><thead><tr><th>Status</th><th>Quantidade</th><th>Soma</th></tr></thead><tbody>")
-    # Ordena pelo maior volume
     for st, qtd in sorted(status_count.items(), key=lambda kv: (-kv[1], kv[0].lower())):
         soma = fmt_brl(float(status_sum.get(st, 0.0)))
         rows.append(f"<tr><td>{html.escape(st)}</td><td>{qtd}</td><td>{soma}</td></tr>")
     rows.append("</tbody></table>")
-    # Badge total
     total_val = fmt_brl(sum(status_sum.values()))
     rows.append(f"<div class='pill'>Soma total: {total_val}</div>")
+    return "".join(rows)
+
+def table_items(event_url: str, items: Optional[List[ItemRow]]) -> str:
+    items = items or []
+    ev_items = [r for r in items if r.event_url == event_url]
+    if not ev_items:
+        return "<p class='muted'>(sem lotes)</p>"
+    rows = ["<table class='grid'><thead><tr><th>Modelo</th><th>Status</th><th>Valor Atual</th></tr></thead><tbody>"]
+    for it in ev_items:
+        rows.append("<tr>"
+                    f"<td>{html.escape(it.model or '')}</td>"
+                    f"<td>{html.escape(it.status_text or '')}</td>"
+                    f"<td>{html.escape(it.current_value or '')}</td>"
+                    "</tr>")
+    rows.append("</tbody></table>")
     return "".join(rows)
 
 class AppHandler(BaseHTTPRequestHandler):
@@ -618,6 +789,17 @@ class AppHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(data)))
             self.end_headers(); self.wfile.write(data); return
 
+        # Download do Excel
+        if self.path.startswith("/export.xlsx"):
+            global EXPORT_BYTES, EXPORT_NAME
+            if not EXPORT_BYTES:
+                self.send_response(404); self.end_headers(); return
+            self.send_response(200)
+            self.send_header("Content-Type","application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+            self.send_header("Content-Disposition", f'attachment; filename="{EXPORT_NAME}"')
+            self.send_header("Content-Length", str(len(EXPORT_BYTES)))
+            self.end_headers(); self.wfile.write(EXPORT_BYTES); return
+
         # UI
         if self.path == "/" or self.path.startswith("/index"):
             body = """
@@ -625,7 +807,7 @@ class AppHandler(BaseHTTPRequestHandler):
               <h1>Carbuy Coletor</h1>
               <p class='muted'>
                 Informe <b>até 3 eventos</b>. No primeiro campo, coloque o <b>código CBY</b> (ex.: <code>200825CBY</code>) ou a <b>URL</b> completa.<br/>
-                O relatório mostra um <b>Resumo do Evento</b> e, abaixo, o <b>Resumo por Status</b> (dinâmico).
+                O relatório mostra um <b>Resumo do Evento</b>, o <b>Resumo por Status</b> e a <b>Tabela de Lotes</b>.
               </p>
               <form method='POST' action='/run'>
                 <div class='row'>
@@ -677,7 +859,15 @@ class AppHandler(BaseHTTPRequestHandler):
         if self.path.startswith("/run"):
             length = int(self.headers.get("Content-Length", "0"))
             data = self.rfile.read(length).decode("utf-8")
-            form = {k: v[0] for k, v in parse_qs(data).items()}
+
+            # leitura robusta do form (evita NoneType)
+            form_raw = parse_qs(data) or {}
+            form: Dict[str, str] = {}
+            for k, v in form_raw.items():
+                if isinstance(v, list) and len(v) > 0:
+                    form[k] = v[0] if v[0] is not None else ""
+                else:
+                    form[k] = ""
 
             # eventos (códigos CBY ou URLs)
             event_inputs = [form.get("event1", ""), form.get("event2", ""), form.get("event3", "")]
@@ -692,31 +882,61 @@ class AppHandler(BaseHTTPRequestHandler):
                 self._ok(base_html("", message=msg)); return
 
             try:
-                summaries = asyncio.run(
+                headers, summaries, items = asyncio.run(
                     scrape(username=username, password=password, headless=headless, event_inputs=event_inputs)
                 )
             except Exception as e:
-                msg = f"<b>Erro:</b> {html.escape(str(e))}"
+                tb = traceback.format_exc()
+                msg = f"<b>Erro:</b> {html.escape(str(e))}<br/><pre style='white-space:pre-wrap'>{html.escape(tb)}</pre>"
                 self._ok(base_html("", message=msg)); return
+
+            # normalizações à prova de None
+            headers = headers or []
+            summaries = summaries or []
+            items = items or []
+
+            # Excel export (tolerante)
+            df = _items_to_dataframe(items)
+            global EXPORT_BYTES, EXPORT_NAME
+            export_ok = True
+            export_err = ""
+            try:
+                EXPORT_BYTES = _make_excel_bytes(df, summaries or [])
+                export_code = (summaries[0].get("Evento") if summaries else "carbuy")
+                EXPORT_NAME = f"carbuy_{export_code}.xlsx"
+            except Exception as ex:
+                EXPORT_BYTES = None
+                export_ok = False
+                export_err = str(ex)
 
             # Cabeçalho geral (tabela básica)
             header_html = table_basic_summary(summaries)
 
-            # Blocos por evento: Resumo por Status
+            # Blocos por evento: Resumo por Status + Tabela de Lotes
             blocks = []
-            for s in summaries:
-                titulo = html.escape(str(s.get("Evento") or "Evento"))
-                blocks.append(
-                    f"<div class='card'><h2>Resumo por Status — {titulo}</h2>{table_status_breakdown(s)}</div>"
-                )
+            if headers and summaries:
+                for i in range(min(len(headers), len(summaries))):
+                    h = headers[i]
+                    s = summaries[i] or {}
+                    titulo = html.escape(str(s.get("Evento") or "Evento"))
+                    blocks.append(f"<div class='card'><h2>Resumo por Status — {titulo}</h2>{table_status_breakdown(s)}</div>")
+                    blocks.append(f"<div class='card'><h2>Lotes — {titulo}</h2>{table_items(h.event_url, items)}</div>")
+            else:
+                blocks.append("<div class='card'><h2>Resumo por Status</h2><p class='muted'>(sem dados)</p></div>")
 
-            body = (
-                "<div class='card'><h1>Resumo do Evento</h1>" + header_html + "</div>"
-                + "".join(blocks) +
+            wa_link = build_whatsapp_text(summaries or [])
+
+            actions_html = (
                 "<div class='card actions'>"
-                "<a class='link btn' href='/'>Voltar</a>"
-                "</div>"
+                + (f"<a class='link btn' href='/export.xlsx'>Exportar para Excel</a>" if export_ok
+                   else "<div class='btn' style='opacity:.6;pointer-events:none' title='Instale openpyxl ou XlsxWriter para habilitar exportação'>Exportar para Excel (indisponível)</div>")
+                + f"<a class='link btn' href='{wa_link}' target='_blank' rel='noopener'>Enviar no WhatsApp</a>"
+                + "<a class='link btn' href='/'>Voltar</a>"
+                + "</div>"
+                + (f"<div class='msg'><b>Aviso:</b> Exportação desabilitada: {html.escape(export_err)}</div>" if not export_ok else "")
             )
+
+            body = "<div class='card'><h1>Resumo do Evento</h1>" + header_html + "</div>" + "".join(blocks) + actions_html
             self._ok(base_html(body)); return
 
         self.send_response(404); self.end_headers()
