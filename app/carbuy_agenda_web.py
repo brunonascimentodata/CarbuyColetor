@@ -37,6 +37,33 @@ DATE_REGEX = re.compile(
     flags=re.IGNORECASE,
 )
 
+# ---- NOVO: Regex e helper para capturar ano no card (ex.: '2019/2020' ou '2020')
+YEAR_PAIR_RE   = re.compile(r'(?:19|20)\d{2}\s*/\s*(?:19|20)\d{2}')
+YEAR_SINGLE_RE = re.compile(r'(?:19|20)\d{2}')
+
+def _extract_year_text_from_card(soup) -> Optional[str]:
+    """
+    Tenta achar '2019/2020' ou um único ano dentro da área do título do card;
+    se não achar, cai pro conteúdo inteiro do card.
+    """
+    for sel in (".card-title h2", ".card-title", "h2"):
+        el = soup.select_one(sel)
+        if el:
+            t = _clean_text(el.get_text(" "))
+            m2 = YEAR_PAIR_RE.search(t)
+            if m2:
+                return re.sub(r'\s+', '', m2.group(0))  # '2019 / 2020' -> '2019/2020'
+            m1 = YEAR_SINGLE_RE.search(t)
+            if m1:
+                return m1.group(0)
+    # fallback varrendo o card todo
+    t_all = _clean_text(soup.get_text(" "))
+    m2 = YEAR_PAIR_RE.search(t_all)
+    if m2:
+        return re.sub(r'\s+', '', m2.group(0))
+    m1 = YEAR_SINGLE_RE.search(t_all)
+    return m1.group(0) if m1 else None
+
 # --------- Seletores tolerantes (login) ----------
 USERNAME_SELECTORS = [
     "input[name='username']",
@@ -201,7 +228,7 @@ async def ensure_login(context, username: str, password: str, return_after: Opti
     """Garante login sem esperar networkidle e sem navegar para o evento (evita abrir duas vezes)."""
     page = await context.new_page()
     try:
-        # Sempre começa pela home (não vamos abrir o evento aqui)
+        # Sempre começa pela home
         ok = await safe_goto(page, BASE_URL, timeout_nav=7000)
         if not ok:
             raise RuntimeError("Navegador fechado durante o login (safe_goto falhou no alvo inicial).")
@@ -302,8 +329,6 @@ async def ensure_login(context, username: str, password: str, return_after: Opti
             except Exception:
                 pass
 
-        # NÃO navegar para o evento aqui.
-        # O loop principal abrirá o(s) evento(s) uma única vez.
     finally:
         try:
             await page.close()
@@ -374,6 +399,11 @@ async def collect_items_current_page(page, event_url: str) -> List[ItemRow]:
                 model = _clean_text(el.get_text(" "))
                 if model:
                     break
+
+        # NOVO: Ano e anexar ao modelo
+        year_text = _extract_year_text_from_card(soup)
+        if model and year_text and year_text not in model:
+            model = f"{model} ({year_text})"
 
         # Situação por texto
         status_text = None
@@ -625,7 +655,6 @@ async def scrape(username: str, password: str, headless: bool, event_inputs: Lis
 
         # Faz login sem abrir o evento (evita abrir duas vezes)
         await ensure_login(context, username, password, return_after=None)
-
 
         # coleta por evento
         for u in urls:
@@ -955,6 +984,9 @@ def run_tests() -> str:
     m = DATE_REGEX.findall("Leilão 21/08/2025 às 15:00")
     assert m and m[0][0]=="21/08/2025" and m[0][1]=="15:00"; out.append("date regex OK")
     assert build_event_url("200825CBY").endswith("/evento/detalhes/200825cby"); out.append("url builder OK")
+    # testes básicos do ano
+    assert _extract_year_text_from_card(BeautifulSoup("<h2>2019 / 2020</h2>", "html.parser")) == "2019/2020"; out.append("year pair OK")
+    assert _extract_year_text_from_card(BeautifulSoup("<h2>2020</h2>", "html.parser")) == "2020"; out.append("year single OK")
     out.append("sanidade OK")
     return "\n".join(out)
 
